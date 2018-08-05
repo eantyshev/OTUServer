@@ -8,6 +8,7 @@ from logging import debug, info, error, exception
 import os
 import sys
 import urllib
+import cStringIO
 
 import asyncore_patch
 
@@ -45,10 +46,6 @@ def filepath(relpath, docroot):
     return fullpath
 
 
-def read_content(filepath):
-    pass
-
-
 def guess_content_type(fpath):
     suffix2mime = {
         '.html': 'text/html',
@@ -66,14 +63,15 @@ def guess_content_type(fpath):
 
 
 class HttpResponse(object):
-    def __init__(self, code, content, content_type=None, content_len=0):
+    def __init__(self, code, content_fp, content_type=None, content_len=0):
         self.code = code
-        self.content = content
+        self.content_fp = content_fp
         self.content_type = content_type
         self.content_len = content_len
         self.utcnow = datetime.utcnow()
 
-    def __str__(self):
+    @property
+    def headers_part(self):
         lines = []
         lines.append("HTTP/1.1 %d %s" % (self.code, CODE_DESCR[self.code]))
         lines.append(self.utcnow.strftime("Date: %a, %d %b %Y %H:%M:%S GMT"))
@@ -83,7 +81,7 @@ class HttpResponse(object):
         if self.content_len is not None:
             lines.append("Content-Length: %d" % self.content_len)
         lines.append("")
-        lines.append(self.content or "")
+        lines.append("")
         return CRLF.join(lines)
 
 
@@ -110,14 +108,13 @@ def serve_one(req, docroot):
         raise
     else:
         debug("... File exists")
-        with fp:
-            content = fp.read()
 
     content_type = guess_content_type(fpath)
+    content_len = os.stat(fpath).st_size
     if req.method == "GET":
-        return HttpResponse(OK, content, content_type, len(content))
+        return HttpResponse(OK, fp, content_type, content_len)
     elif req.method == "HEAD":
-        return HttpResponse(OK, None, content_type, len(content))
+        return HttpResponse(OK, None, content_type, content_len)
     else:
         return HttpResponse(NOT_ALLOWED, None)
 
@@ -159,31 +156,43 @@ class HttpRequest(object):
         )
 
 
+class ContentProducer:
+    def __init__ (self, fp, buffer_size=4096):
+        self.fp = fp
+        self.buffer_size = buffer_size
+
+    def more (self):
+        data = self.fp.read(self.buffer_size)
+        return data
+
+
 class HttpHandler(asynchat.async_chat):
 
     def __init__(self, sock, addr, docroot):
         asynchat.async_chat.__init__(self, sock=sock)
         self.docroot = docroot
-        self.ibuffer = []
+        self.ibuffer = cStringIO.StringIO()
         self.set_terminator(CRLF + CRLF)
         self.logger = logging.getLogger("handler_%s" % (addr,))
 
     def collect_incoming_data(self, data):
         """Buffer the data"""
         self.logger.debug("< %s", data)
-        self.ibuffer.append(data)
+        self.ibuffer.write(data)
 
     def found_terminator(self):
-        req = HttpRequest.from_data("".join(self.ibuffer))
+        req = HttpRequest.from_data(self.ibuffer.getvalue())
         resp = serve_one(req, self.docroot)
-        self.push(str(resp))
+        self.push(resp.headers_part)
+        if resp.content_fp:
+            self.push_with_producer(ContentProducer(resp.content_fp))
         #self.logger.debug("> %s" % resp)
         if req.headers.get("Connection") != "keep-alive":
             self.logger.debug("close_when_done")
             self.close_when_done()
         else:
             self.logger.debug("re-using connection")
-            self.ibuffer = []
+            self.ibuffer = cStringIO.StringIO()
 
 
 class HttpServer(asyncore.dispatcher):
